@@ -4,6 +4,9 @@ import time
 import requests
 import pandas as pd
 import streamlit as st
+import yfinance as yf
+dxy = yf.download("DX-Y.NYB", period="1d", interval="1d")["Close"].iloc[-1]
+
 
 st.set_page_config(page_title="BTC Top Signals — Live", layout="wide")
 st.write("🔧 Initialising…")
@@ -285,3 +288,4 @@ st.line_chart(
 
 st.caption("Now powered by CoinPaprika (free) with Binance price fallback. Retries are enabled to avoid 429s.")
 st.markdown(f'<meta http-equiv="refresh" content="{int(refresh_s)}">', unsafe_allow_html=True)
+
