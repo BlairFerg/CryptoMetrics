@@ -354,9 +354,12 @@ st.caption("Free, live data only: CoinPaprika + Binance fallback, Yahoo Finance 
 st.markdown(f'<meta http-equiv="refresh" content="{int(refresh_s)}">', unsafe_allow_html=True)
 
 # ==================== LLM assistant (Hugging Face Space) ====================
+import json, threading, queue, time as _t
+from gradio_client import Client
+
 st.markdown("## Assistant")
 with st.expander("🤖 Ask the dashboard (LLM on Hugging Face Space)"):
-    st.caption("Queries a public Hugging Face Space using the current dashboard context (metrics, signals, recent history).")
+    st.caption("Queries your public Hugging Face Space with the current dashboard context (compact).")
 
     def normalize_space_id(s: str) -> str:
         s = s.strip()
@@ -369,58 +372,110 @@ with st.expander("🤖 Ask the dashboard (LLM on Hugging Face Space)"):
 
     space_id_input = st.text_input(
         "Hugging Face Space",
-        value="BlairFerg/crypto_metrics",  # ← your Space id
-        help="Use owner/space-name or full URL to your Space."
+        value="BlairFerg/crypto_metrics",
+        help="Use owner/space-name or full URL to your Space.",
     )
     space_id = normalize_space_id(space_id_input)
 
-    api_hint = st.selectbox("API endpoint", options=["/chat", "/predict"], index=0)  # ChatInterface = /chat
+    st.caption("Endpoint will be auto-detected; choose manually only if needed.")
+    manual_api = st.selectbox("Force API (optional)", options=["(auto)", "/chat", "/predict", "/generate"], index=0)
 
     question = st.text_area("Your question", placeholder="e.g., Which signals are closest to flipping?")
-    history_points = st.slider("Include last N history rows", 10, 200, 60)
+    history_points = st.slider("Include last N history rows", 10, 100, 30)
+    max_wait = st.slider("LLM call timeout (seconds)", 5, 60, 25)
 
-    def build_context(metrics, sig_df, hist_df, n=60):
-        # Keep it compact but useful
-        return {
-            "metrics": metrics,
-            "signals": sig_df.to_dict(orient="records"),
-            "history_tail": hist_df.tail(n).reset_index().astype(str).to_dict(orient="records"),
-        }
+    # --- make the context small & fast to tokenize ---
+    def summarize_for_llm(metrics, sig_df, hist_df, n=30):
+        # keep only essential numeric fields + tiny trend deltas
+        cols = [c for c in ["btc_dominance","usdt_dominance","stable_dominance",
+                            "alt_mcap_usd","btc_mcap_usd","eth_mcap_usd","dxy"] if c in hist_df.columns]
+        tail = hist_df.reset_index()[["ts", *cols]].tail(n)
 
-    def call_space(space: str, prompt: str, api_guess: str, tries=None, timeout_s=60):
-        client = Client(space, verbose=False)
-        candidates = tries or [api_guess, "/chat", "/predict", "/generate"]
-        last_err = None
-        for api in candidates:
-            try:
-                # Many Spaces accept (text,) and return a string.
-                out = client.predict(prompt, api_name=api)
-                if isinstance(out, (list, tuple)):
-                    return "\n".join(map(str, out)), api
-                if isinstance(out, dict):
-                    return json.dumps(out, indent=2), api
-                return str(out), api
-            except Exception as e:
-                last_err = e
+        def nn_last(s):
+            s = s.dropna()
+            return s.iloc[-1] if not s.empty else None
+        def nn_first(s):
+            s = s.dropna()
+            return s.iloc[0] if not s.empty else None
+
+        window = {}
+        for c in cols:
+            start, end = nn_first(tail[c]), nn_last(tail[c])
+            if start is None or end is None:
                 continue
-        raise last_err if last_err else RuntimeError("No compatible API found on the Space.")
+            delta = end - start
+            pct = (delta / start) if start else None
+            window[c] = {"start": start, "end": end, "delta": delta, "pct": pct}
+
+        sig_small = sig_df[["Signal","Metric key","Value","Operator","Threshold","Status"]].to_dict(orient="records")
+        return {"now": metrics, "signals": sig_small, "window": window, "points_used": min(n, len(tail))}
+
+    def detect_api(client: Client):
+        """
+        Ask the Space what endpoints it exposes. Prefer /chat, then /predict, then /generate.
+        """
+        try:
+            info = client.view_api()  # returns a dict describing endpoints
+            names = []
+            if isinstance(info, dict):
+                if "endpoints" in info:
+                    names = [e.get("api_name") for e in info["endpoints"] if e.get("api_name")]
+            # Fallback order if not found
+            for cand in ["/chat", "/predict", "/generate"]:
+                if cand in names:
+                    return cand
+        except Exception:
+            pass
+        # Default order if discovery fails
+        return "/chat"
+
+    def _predict_blocking(space: str, api_name: str, prompt: str, out_q: queue.Queue):
+        try:
+            client = Client(space, verbose=False)
+            # If manual_api is "(auto)", detect; else trust user choice
+            api = api_name if api_name not in ("", "(auto)") else detect_api(client)
+            result = client.predict(prompt, api_name=api)
+            # Normalize output
+            if isinstance(result, (list, tuple)):
+                result = "\n".join(map(str, result))
+            elif isinstance(result, dict):
+                result = json.dumps(result, indent=2)
+            out_q.put(("ok", result, api))
+        except Exception as e:
+            out_q.put(("err", str(e), api_name))
 
     if st.button("Ask"):
-        with st.spinner("Contacting the Space…"):
-            try:
-                ctx = build_context(metrics, sig_df, hist_df, n=history_points)
-                context_text = json.dumps(ctx, indent=2)
+        if not question.strip():
+            st.warning("Type a question first.")
+        else:
+            with st.spinner("Contacting the Space…"):
+                ctx = summarize_for_llm(metrics, sig_df, hist_df, n=history_points)
+                ctx_text = json.dumps(ctx, separators=(",", ":"))  # compact -> faster
                 prompt = (
-                    "You are a concise crypto analyst. Use ONLY the JSON context to answer.\n"
-                    "Explain thresholds/signal logic clearly; cite key numbers.\n\n"
-                    f"CONTEXT JSON:\n{context_text}\n\n"
-                    f"QUESTION: {question}\n"
+                    "You are a concise crypto analyst. Use ONLY the JSON context. "
+                    "Answer briefly (<=120 words). If unknown, say so.\n"
+                    f"CONTEXT={ctx_text}\nQUESTION={question.strip()}\n"
                 )
-                answer, used_api = call_space(space_id, prompt, api_hint)
-                st.success(f"Space responded (api: {used_api})")
-                st.markdown("**Answer**")
-                st.write(answer)
-            except Exception as e:
-                st.error(f"LLM call failed: {e}")
-                st.info("Check the Space id and that it’s public & running. "
-                        "ChatInterface exposes /chat; Interface exposes /predict.")
+
+                q = queue.Queue(maxsize=1)
+                t0 = _t.time()
+                worker = threading.Thread(target=_predict_blocking,
+                                          args=(space_id, manual_api, prompt, q),
+                                          daemon=True)
+                worker.start()
+                worker.join(timeout=max_wait)
+
+                if worker.is_alive():
+                    st.error(f"Timed out after {max_wait}s. The Space may be cold or overloaded.")
+                    st.info("Try again in ~30s, or reduce timeout, or verify the Space is Running.")
+                else:
+                    status, payload, used_api = q.get()
+                    if status == "ok":
+                        st.success(f"Space responded (api: {used_api}) in {_t.time()-t0:.1f}s")
+                        st.markdown("**Answer**")
+                        st.write(payload)
+                    else:
+                        st.error(f"LLM call failed: {payload}")
+                        st.info("Tips: Check Space id; ensure it's public & Running; "
+                                "pick the correct endpoint (/chat for ChatInterface, /predict for Interface).")
+
