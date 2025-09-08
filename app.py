@@ -1,10 +1,14 @@
-# app.py — BTC TOP Signals (free data) + HF Space LLM assistant
-# Data: CoinPaprika (global + tickers), Binance (price fallback), yfinance (DXY & BTC MAs)
-# LLM: Hugging Face Space (Gradio ChatInterface) via gradio_client
+# app.py — BTC TOP Signals + Hugging Face Space assistant (free data only)
+# Data: CoinPaprika (global+tickers), Binance (price fallback), yfinance (DXY + BTC MAs)
+# Assistant: calls your public HF Space via gradio_client (prefer the .hf.space URL to avoid Hub API 429s)
 
+import json
 import random
 import time
-import json
+import threading
+import queue
+from typing import Tuple
+
 import requests
 import pandas as pd
 import streamlit as st
@@ -125,7 +129,6 @@ def get_btc_history():
 # ------------------ Compute metrics (free + robust) ------------------
 def compute_metrics_safe(include_dxy=True):
     issues, metrics = [], {}
-
     # Global (total mcap + BTC dominance)
     try:
         g = get_global_cached()
@@ -281,6 +284,7 @@ with st.sidebar:
 # ------------------ Data fetch & KPIs ------------------
 st.title("BTC TOP Signals — Live Dashboard")
 
+pull_ts_utc = pd.Timestamp.utcnow()
 metrics, issues = compute_metrics_safe(include_dxy=use_dxy)
 if issues:
     st.warning(" · ".join(issues))
@@ -294,6 +298,9 @@ k2.metric("BTC Dominance",   fmt(metrics.get("btc_dominance"), "pct"))
 k3.metric("USDT Dominance",  fmt(metrics.get("usdt_dominance"), "pct"))
 k4.metric("Alt Market Cap",  fmt(metrics.get("alt_mcap_usd"), "usdT"))
 k5.metric("DXY",             fmt(metrics.get("dxy"), "num2"))
+
+# NEW: show last data pull time (UTC)
+st.caption(f"Last data pull: {pull_ts_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
 # ------------------ Signals (free-only) ------------------
 signal_defs = [
@@ -327,7 +334,7 @@ st.dataframe(sig_df, use_container_width=True)
 if "hist" not in st.session_state:
     st.session_state.hist = []
 
-row = {"ts": pd.Timestamp.utcnow()}
+row = {"ts": pull_ts_utc}
 row.update({k: (float(v) if isinstance(v, (int, float)) else v) for k, v in metrics.items()})
 st.session_state.hist.append(row)
 st.session_state.hist = st.session_state.hist[-500:]
@@ -354,39 +361,43 @@ st.caption("Free, live data only: CoinPaprika + Binance fallback, Yahoo Finance 
 st.markdown(f'<meta http-equiv="refresh" content="{int(refresh_s)}">', unsafe_allow_html=True)
 
 # ==================== LLM assistant (Hugging Face Space) ====================
-import json, threading, queue, time as _t
-from gradio_client import Client
-
 st.markdown("## Assistant")
 with st.expander("🤖 Ask the dashboard (LLM on Hugging Face Space)"):
-    st.caption("Queries your public Hugging Face Space with the current dashboard context (compact).")
+    st.caption("Queries your public Hugging Face Space with a compact JSON context.")
 
-    def normalize_space_id(s: str) -> str:
+    # Cool-down to avoid accidental rapid-fire requests (helps avoid 429s)
+    if "last_ask_ts" not in st.session_state:
+        st.session_state.last_ask_ts = 0.0
+    now_ts = time.time()
+    cooldown = 4.0
+
+    def normalize_space_target(s: str) -> Tuple[str, bool]:
+        """
+        Returns (target, is_direct_url).
+        If user pasted a full *.hf.space URL, return it and mark as direct.
+        Otherwise return owner/space id.
+        """
         s = s.strip()
         if s.startswith("http"):
-            # Accept full URLs like https://huggingface.co/spaces/<owner>/<space>
-            parts = s.split("/spaces/")[-1].split("/")
-            if len(parts) >= 2:
-                return f"{parts[0]}/{parts[1]}"
-        return s
+            return s, True
+        return s, False
 
-    space_id_input = st.text_input(
-        "Hugging Face Space",
-        value="BlairFerg/crypto_metrics",
-        help="Use owner/space-name or full URL to your Space.",
+    # Prefer the direct .hf.space URL to bypass Hub API 429s
+    space_target_in = st.text_input(
+        "Hugging Face Space (id or .hf.space URL)",
+        value="https://blairferg-crypto-metrics.hf.space",
+        help="Prefer the full .hf.space URL to avoid Hub API rate limits."
     )
-    space_id = normalize_space_id(space_id_input)
+    space_target, is_direct = normalize_space_target(space_target_in)
 
-    st.caption("Endpoint will be auto-detected; choose manually only if needed.")
     manual_api = st.selectbox("Force API (optional)", options=["(auto)", "/chat", "/predict", "/generate"], index=0)
 
     question = st.text_area("Your question", placeholder="e.g., Which signals are closest to flipping?")
     history_points = st.slider("Include last N history rows", 10, 100, 30)
     max_wait = st.slider("LLM call timeout (seconds)", 5, 60, 25)
 
-    # --- make the context small & fast to tokenize ---
+    # --- build a tiny, fast-to-tokenize context ---
     def summarize_for_llm(metrics, sig_df, hist_df, n=30):
-        # keep only essential numeric fields + tiny trend deltas
         cols = [c for c in ["btc_dominance","usdt_dominance","stable_dominance",
                             "alt_mcap_usd","btc_mcap_usd","eth_mcap_usd","dxy"] if c in hist_df.columns]
         tail = hist_df.reset_index()[["ts", *cols]].tail(n)
@@ -410,32 +421,22 @@ with st.expander("🤖 Ask the dashboard (LLM on Hugging Face Space)"):
         sig_small = sig_df[["Signal","Metric key","Value","Operator","Threshold","Status"]].to_dict(orient="records")
         return {"now": metrics, "signals": sig_small, "window": window, "points_used": min(n, len(tail))}
 
-    def detect_api(client: Client):
-        """
-        Ask the Space what endpoints it exposes. Prefer /chat, then /predict, then /generate.
-        """
+    def detect_api_safe(client: Client) -> str:
         try:
-            info = client.view_api()  # returns a dict describing endpoints
-            names = []
-            if isinstance(info, dict):
-                if "endpoints" in info:
-                    names = [e.get("api_name") for e in info["endpoints"] if e.get("api_name")]
-            # Fallback order if not found
+            info = client.view_api()
+            names = [e.get("api_name") for e in info.get("endpoints", []) if e.get("api_name")]
             for cand in ["/chat", "/predict", "/generate"]:
                 if cand in names:
                     return cand
         except Exception:
             pass
-        # Default order if discovery fails
         return "/chat"
 
-    def _predict_blocking(space: str, api_name: str, prompt: str, out_q: queue.Queue):
+    def _predict_blocking(target: str, is_direct: bool, api_name: str, prompt: str, out_q: queue.Queue):
         try:
-            client = Client(space, verbose=False)
-            # If manual_api is "(auto)", detect; else trust user choice
-            api = api_name if api_name not in ("", "(auto)") else detect_api(client)
+            client = Client(target, verbose=False)  # direct URL or owner/space both supported
+            api = api_name if api_name not in ("", "(auto)") else detect_api_safe(client)
             result = client.predict(prompt, api_name=api)
-            # Normalize output
             if isinstance(result, (list, tuple)):
                 result = "\n".join(map(str, result))
             elif isinstance(result, dict):
@@ -444,13 +445,16 @@ with st.expander("🤖 Ask the dashboard (LLM on Hugging Face Space)"):
         except Exception as e:
             out_q.put(("err", str(e), api_name))
 
-    if st.button("Ask"):
+    disabled = (now_ts - st.session_state.last_ask_ts < cooldown)
+    ask = st.button("Ask", disabled=disabled)
+    if ask:
         if not question.strip():
             st.warning("Type a question first.")
         else:
+            st.session_state.last_ask_ts = now_ts
             with st.spinner("Contacting the Space…"):
                 ctx = summarize_for_llm(metrics, sig_df, hist_df, n=history_points)
-                ctx_text = json.dumps(ctx, separators=(",", ":"))  # compact -> faster
+                ctx_text = json.dumps(ctx, separators=(",", ":"))  # compact JSON
                 prompt = (
                     "You are a concise crypto analyst. Use ONLY the JSON context. "
                     "Answer briefly (<=120 words). If unknown, say so.\n"
@@ -458,24 +462,23 @@ with st.expander("🤖 Ask the dashboard (LLM on Hugging Face Space)"):
                 )
 
                 q = queue.Queue(maxsize=1)
-                t0 = _t.time()
+                t0 = time.time()
                 worker = threading.Thread(target=_predict_blocking,
-                                          args=(space_id, manual_api, prompt, q),
+                                          args=(space_target, is_direct, manual_api, prompt, q),
                                           daemon=True)
                 worker.start()
                 worker.join(timeout=max_wait)
 
                 if worker.is_alive():
                     st.error(f"Timed out after {max_wait}s. The Space may be cold or overloaded.")
-                    st.info("Try again in ~30s, or reduce timeout, or verify the Space is Running.")
+                    st.info("Try again in ~30s, or verify the Space is Running. Prefer the .hf.space URL.")
                 else:
                     status, payload, used_api = q.get()
                     if status == "ok":
-                        st.success(f"Space responded (api: {used_api}) in {_t.time()-t0:.1f}s")
+                        st.success(f"Space responded (api: {used_api}) in {time.time()-t0:.1f}s")
                         st.markdown("**Answer**")
                         st.write(payload)
                     else:
                         st.error(f"LLM call failed: {payload}")
-                        st.info("Tips: Check Space id; ensure it's public & Running; "
-                                "pick the correct endpoint (/chat for ChatInterface, /predict for Interface).")
-
+                        st.info("Tips: Use the .hf.space URL, ensure the Space is public & Running, "
+                                "and pick the correct endpoint (/chat for ChatInterface, /predict for Interface).")
