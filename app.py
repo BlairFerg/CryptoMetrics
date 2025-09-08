@@ -359,5 +359,91 @@ st.line_chart(
     height=280
 )
 
+# ==================== LLM assistant (Gradio Space) ====================
+from gradio_client import Client, handle_file
+import json
+
+st.markdown("## Assistant")
+with st.expander("🤖 Ask the dashboard (LLM on Hugging Face Space)"):
+    st.caption("Asks a public LLM on Hugging Face with the current dashboard context. No API key needed for public Spaces.")
+
+    # Default to a widely used public chat demo. You can replace with any public Space id "owner/space-name".
+    space_id = st.text_input(
+        "Hugging Face Space id",
+        value="HuggingFaceH4/zephyr-7b-beta",  # change to your preferred public Space
+        help="Format: owner/space-name (must be a public Space that accepts text and returns text)."
+    )
+    api_hint = st.text_input(
+        "Optional API name hint",
+        value="/chat",
+        help="Common values: /chat, /predict, /generate. Leave as /chat to auto-try the usual suspects."
+    )
+
+    user_q = st.text_area("Your question", placeholder="e.g., Which signals are closest to flipping? What changed in the last hour?")
+    max_hist = st.slider("Include last N history points", 10, 200, 60, help="Sent to the LLM so it can reason about trends.")
+    run_btn = st.button("Ask")
+
+    def build_context(metrics, sig_df, hist_df, n=60):
+        # Compact dict to keep prompt small
+        ctx = {
+            "metrics": {k: v for k, v in metrics.items()},
+            "signals": sig_df.to_dict(orient="records"),
+            "history_tail": hist_df.tail(n).reset_index().astype(str).to_dict(orient="records"),
+        }
+        return ctx
+
+    def call_space(space: str, prompt: str, api_guess: str):
+        """
+        Tries to call a public Gradio Space with text->text interface.
+        Attempts common api_names in order.
+        """
+        client = Client(space, verbose=False)
+
+        # Try in this order; include the user hint first
+        api_candidates = []
+        if api_guess and api_guess.strip():
+            api_candidates.append(api_guess.strip())
+        api_candidates += ["/chat", "/predict", "/generate", "/run", "/completion"]
+
+        last_err = None
+        for api in api_candidates:
+            try:
+                # Most Spaces accept (text,) and return a string.
+                out = client.predict(prompt, api_name=api)
+                # If the output is dict/list, coerce nicely
+                if isinstance(out, (list, tuple)):
+                    out = "\n".join(map(str, out))
+                elif isinstance(out, dict):
+                    out = json.dumps(out, indent=2)
+                return out, api
+            except Exception as e:
+                last_err = e
+                continue
+        raise last_err if last_err else RuntimeError("No compatible API found.")
+
+    if run_btn:
+        with st.spinner("Contacting the Space…"):
+            try:
+                # Build a compact, readable context
+                context = build_context(metrics, sig_df, hist_df, n=max_hist)
+                context_text = json.dumps(context, indent=2)
+
+                # Compose the final prompt
+                prompt = (
+                    "You are a helpful crypto analyst. Answer the user's question using ONLY this JSON context.\n"
+                    "Be concise, cite exact numbers when useful, and explain signal logic clearly.\n\n"
+                    f"CONTEXT JSON:\n{context_text}\n\n"
+                    f"QUESTION: {user_q}\n"
+                )
+
+                answer, used_api = call_space(space_id, prompt, api_hint)
+                st.success(f"Space responded (api: {used_api})")
+                st.markdown("**Answer**")
+                st.write(answer)
+            except Exception as e:
+                st.error(f"LLM call failed: {e}")
+                st.info("Tips: Ensure the Space is public, running, and has a simple text input → text output API like /chat or /predict.")
+
 st.caption("Free, live data only: CoinPaprika + Binance fallback, Yahoo Finance for DXY & BTC moving averages.")
 st.markdown(f'<meta http-equiv="refresh" content="{int(refresh_s)}">', unsafe_allow_html=True)
+
