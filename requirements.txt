@@ -3,3 +3,6 @@ streamlit==1.36.0
 requests>=2.31.0
 pandas>=2.2.0
 yfinance
+gradio-client>=1.3.0
+gradio>=4.44.0
+
