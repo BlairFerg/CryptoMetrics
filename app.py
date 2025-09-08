@@ -48,15 +48,7 @@ def binance_price(symbol="BTCUSDT"):
     return float(j["price"])
 
 # ------------------ Optional DXY (may be flaky) ------------------
-def get_dxy():
-    url = "https://stooq.com/q/d/l/?s=dxy&i=d"
-    r = requests.get(url, timeout=20, headers=UA)
-    r.raise_for_status()
-    lines = r.text.strip().splitlines()
-    if len(lines) < 2:
-        raise RuntimeError("DXY CSV empty")
-    last = lines[-1].split(",")
-    return float(last[4])  # Close
+
 
 # ------------------ Cached wrappers ------------------
 @st.cache_data(ttl=300)
@@ -288,4 +280,5 @@ st.line_chart(
 
 st.caption("Now powered by CoinPaprika (free) with Binance price fallback. Retries are enabled to avoid 429s.")
 st.markdown(f'<meta http-equiv="refresh" content="{int(refresh_s)}">', unsafe_allow_html=True)
+
 
