@@ -1,19 +1,21 @@
-# app.py — BTC TOP Signals (free data only)
-# Sources: CoinPaprika (global + tickers), Binance (price fallback), Yahoo Finance (DXY, BTC history)
+# app.py — BTC TOP Signals (free data) + HF Space LLM assistant
+# Data: CoinPaprika (global + tickers), Binance (price fallback), yfinance (DXY & BTC MAs)
+# LLM: Hugging Face Space (Gradio ChatInterface) via gradio_client
 
 import random
 import time
+import json
 import requests
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+from gradio_client import Client
 
 st.set_page_config(page_title="BTC Top Signals — Live", layout="wide")
 st.write("🔧 Initialising…")
 st.set_option("client.showErrorDetails", True)
 
 UA = {"User-Agent": "Mozilla/5.0 (compatible; StreamlitBot/1.0)"}
-
 
 # ------------------ HTTP helper (retries) ------------------
 def fetch_json(url, params=None, timeout=20, max_retries=4, backoff=0.6):
@@ -30,9 +32,7 @@ def fetch_json(url, params=None, timeout=20, max_retries=4, backoff=0.6):
             time.sleep(backoff * (2 ** i) + random.uniform(0, 0.3))
     raise last_err
 
-
 # ------------------ Crypto (CoinPaprika + Binance fallback) ------------------
-# Docs: https://api.coinpaprika.com/
 def paprika_global():
     return fetch_json("https://api.coinpaprika.com/v1/global")
 
@@ -42,7 +42,6 @@ def paprika_ticker(coin_id):
 def binance_price(symbol="BTCUSDT"):
     j = fetch_json("https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol})
     return float(j["price"])
-
 
 # ------------------ DXY via yfinance (with Stooq fallback) ------------------
 def get_dxy_yf():
@@ -77,7 +76,6 @@ def get_dxy_cached():
         except Exception:
             return None
 
-
 # ------------------ Cached wrappers for crypto ------------------
 @st.cache_data(ttl=300)
 def get_global_cached():
@@ -90,7 +88,6 @@ def get_ticker_cached(coin_id):
 @st.cache_data(ttl=120)
 def get_binance_price_cached(symbol):
     return binance_price(symbol)
-
 
 # ------------------ BTC history for moving averages ------------------
 @st.cache_data(ttl=600)
@@ -124,7 +121,6 @@ def get_btc_history():
         "sma200": sma200_f,
         "price_to_sma200": (price_f / sma200_f) if sma200_f else None
     }
-
 
 # ------------------ Compute metrics (free + robust) ------------------
 def compute_metrics_safe(include_dxy=True):
@@ -230,7 +226,6 @@ def compute_metrics_safe(include_dxy=True):
 
     return metrics, issues
 
-
 # ------------------ Logic & formatting ------------------
 def check(val, op, thr):
     if val is None or thr is None:
@@ -265,7 +260,6 @@ def pretty_value(key, val):
         return f"{val:.2f}"
     return f"{val}"
 
-
 # ------------------ Sidebar ------------------
 with st.sidebar:
     st.header("Signal thresholds")
@@ -284,7 +278,6 @@ with st.sidebar:
     use_dxy   = st.checkbox("Use DXY signal", value=True)
     refresh_s = st.slider("Auto-refresh (seconds)", 10, 300, 60)
 
-
 # ------------------ Data fetch & KPIs ------------------
 st.title("BTC TOP Signals — Live Dashboard")
 
@@ -301,7 +294,6 @@ k2.metric("BTC Dominance",   fmt(metrics.get("btc_dominance"), "pct"))
 k3.metric("USDT Dominance",  fmt(metrics.get("usdt_dominance"), "pct"))
 k4.metric("Alt Market Cap",  fmt(metrics.get("alt_mcap_usd"), "usdT"))
 k5.metric("DXY",             fmt(metrics.get("dxy"), "num2"))
-
 
 # ------------------ Signals (free-only) ------------------
 signal_defs = [
@@ -331,7 +323,6 @@ sig_df = pd.DataFrame(rows)
 st.subheader("Signals")
 st.dataframe(sig_df, use_container_width=True)
 
-
 # ------------------ Session history & charts ------------------
 if "hist" not in st.session_state:
     st.session_state.hist = []
@@ -359,91 +350,77 @@ st.line_chart(
     height=280
 )
 
-# ==================== LLM assistant (Gradio Space) ====================
-from gradio_client import Client, handle_file
-import json
+st.caption("Free, live data only: CoinPaprika + Binance fallback, Yahoo Finance for DXY & BTC moving averages.")
+st.markdown(f'<meta http-equiv="refresh" content="{int(refresh_s)}">', unsafe_allow_html=True)
 
+# ==================== LLM assistant (Hugging Face Space) ====================
 st.markdown("## Assistant")
 with st.expander("🤖 Ask the dashboard (LLM on Hugging Face Space)"):
-    st.caption("Asks a public LLM on Hugging Face with the current dashboard context. No API key needed for public Spaces.")
+    st.caption("Queries a public Hugging Face Space using the current dashboard context (metrics, signals, recent history).")
 
-    # Default to a widely used public chat demo. You can replace with any public Space id "owner/space-name".
-    space_id = st.text_input(
-        "Hugging Face Space id",
-        value="HuggingFaceH4/zephyr-7b-beta",  # change to your preferred public Space
-        help="Format: owner/space-name (must be a public Space that accepts text and returns text)."
-    )
-    api_hint = st.text_input(
-        "Optional API name hint",
-        value="/chat",
-        help="Common values: /chat, /predict, /generate. Leave as /chat to auto-try the usual suspects."
-    )
+    def normalize_space_id(s: str) -> str:
+        s = s.strip()
+        if s.startswith("http"):
+            # Accept full URLs like https://huggingface.co/spaces/<owner>/<space>
+            parts = s.split("/spaces/")[-1].split("/")
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+        return s
 
-    user_q = st.text_area("Your question", placeholder="e.g., Which signals are closest to flipping? What changed in the last hour?")
-    max_hist = st.slider("Include last N history points", 10, 200, 60, help="Sent to the LLM so it can reason about trends.")
-    run_btn = st.button("Ask")
+    space_id_input = st.text_input(
+        "Hugging Face Space",
+        value="BlairFerg/crypto_metrics",  # ← your Space id
+        help="Use owner/space-name or full URL to your Space."
+    )
+    space_id = normalize_space_id(space_id_input)
+
+    api_hint = st.selectbox("API endpoint", options=["/chat", "/predict"], index=0)  # ChatInterface = /chat
+
+    question = st.text_area("Your question", placeholder="e.g., Which signals are closest to flipping?")
+    history_points = st.slider("Include last N history rows", 10, 200, 60)
 
     def build_context(metrics, sig_df, hist_df, n=60):
-        # Compact dict to keep prompt small
-        ctx = {
-            "metrics": {k: v for k, v in metrics.items()},
+        # Keep it compact but useful
+        return {
+            "metrics": metrics,
             "signals": sig_df.to_dict(orient="records"),
             "history_tail": hist_df.tail(n).reset_index().astype(str).to_dict(orient="records"),
         }
-        return ctx
 
-    def call_space(space: str, prompt: str, api_guess: str):
-        """
-        Tries to call a public Gradio Space with text->text interface.
-        Attempts common api_names in order.
-        """
+    def call_space(space: str, prompt: str, api_guess: str, tries=None, timeout_s=60):
         client = Client(space, verbose=False)
-
-        # Try in this order; include the user hint first
-        api_candidates = []
-        if api_guess and api_guess.strip():
-            api_candidates.append(api_guess.strip())
-        api_candidates += ["/chat", "/predict", "/generate", "/run", "/completion"]
-
+        candidates = tries or [api_guess, "/chat", "/predict", "/generate"]
         last_err = None
-        for api in api_candidates:
+        for api in candidates:
             try:
-                # Most Spaces accept (text,) and return a string.
+                # Many Spaces accept (text,) and return a string.
                 out = client.predict(prompt, api_name=api)
-                # If the output is dict/list, coerce nicely
                 if isinstance(out, (list, tuple)):
-                    out = "\n".join(map(str, out))
-                elif isinstance(out, dict):
-                    out = json.dumps(out, indent=2)
-                return out, api
+                    return "\n".join(map(str, out)), api
+                if isinstance(out, dict):
+                    return json.dumps(out, indent=2), api
+                return str(out), api
             except Exception as e:
                 last_err = e
                 continue
-        raise last_err if last_err else RuntimeError("No compatible API found.")
+        raise last_err if last_err else RuntimeError("No compatible API found on the Space.")
 
-    if run_btn:
+    if st.button("Ask"):
         with st.spinner("Contacting the Space…"):
             try:
-                # Build a compact, readable context
-                context = build_context(metrics, sig_df, hist_df, n=max_hist)
-                context_text = json.dumps(context, indent=2)
-
-                # Compose the final prompt
+                ctx = build_context(metrics, sig_df, hist_df, n=history_points)
+                context_text = json.dumps(ctx, indent=2)
                 prompt = (
-                    "You are a helpful crypto analyst. Answer the user's question using ONLY this JSON context.\n"
-                    "Be concise, cite exact numbers when useful, and explain signal logic clearly.\n\n"
+                    "You are a concise crypto analyst. Use ONLY the JSON context to answer.\n"
+                    "Explain thresholds/signal logic clearly; cite key numbers.\n\n"
                     f"CONTEXT JSON:\n{context_text}\n\n"
-                    f"QUESTION: {user_q}\n"
+                    f"QUESTION: {question}\n"
                 )
-
                 answer, used_api = call_space(space_id, prompt, api_hint)
                 st.success(f"Space responded (api: {used_api})")
                 st.markdown("**Answer**")
                 st.write(answer)
             except Exception as e:
                 st.error(f"LLM call failed: {e}")
-                st.info("Tips: Ensure the Space is public, running, and has a simple text input → text output API like /chat or /predict.")
-
-st.caption("Free, live data only: CoinPaprika + Binance fallback, Yahoo Finance for DXY & BTC moving averages.")
-st.markdown(f'<meta http-equiv="refresh" content="{int(refresh_s)}">', unsafe_allow_html=True)
-
+                st.info("Check the Space id and that it’s public & running. "
+                        "ChatInterface exposes /chat; Interface exposes /predict.")
