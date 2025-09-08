@@ -360,6 +360,8 @@ st.line_chart(
 st.caption("Free, live data only: CoinPaprika + Binance fallback, Yahoo Finance for DXY & BTC moving averages.")
 st.markdown(f'<meta http-equiv="refresh" content="{int(refresh_s)}">', unsafe_allow_html=True)
 
+
+'''
 # ==================== LLM assistant (Hugging Face Space) ====================
 import json, threading, queue, time as _t
 from gradio_client import Client
@@ -500,3 +502,5 @@ with st.expander("🤖 Ask the dashboard (LLM on Hugging Face Space)"):
                         st.error(f"LLM call failed: {payload}")
                         st.info("If this persists, set 'Force API' to /predict and try again, "
                                 "or paste the full .hf.space URL above.")
+
+'''
